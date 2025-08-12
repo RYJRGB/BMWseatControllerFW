@@ -18,16 +18,23 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "board.h"
+#include "usbd_cdc_if.h"
+#include <string.h>
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
-
+extern UART_HandleTypeDef huart2;   // USART2 from CubeMX (LIN mode)
+static uint8_t make_lin_id_with_parity(uint8_t id6);
+static HAL_StatusTypeDef lin_send_header(UART_HandleTypeDef *huart, uint8_t id6);
+static int lin_receive_response(UART_HandleTypeDef *huart, uint8_t *buf, int max_len, uint32_t timeout_ms);
+static void cdc_print_hex(const char *prefix, const uint8_t *data, int len);
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -45,8 +52,6 @@ I2C_HandleTypeDef hi2c1;
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 
-PCD_HandleTypeDef hpcd_USB_OTG_FS;
-
 /* USER CODE BEGIN PV */
 
 /* USER CODE END PV */
@@ -57,13 +62,97 @@ static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_USART2_UART_Init(void);
-static void MX_USB_OTG_FS_PCD_Init(void);
 /* USER CODE BEGIN PFP */
 void SetHalfBridge(HalfBridge_t hb, Direction_t dir);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+void LIN_Ping_And_Print(void)
+{
+    HAL_Delay(1000); // give host time to open the COM port (simple safety)
+
+    uint8_t id = 0x01; // 6-bit LIN ID (0..63)
+
+    if (lin_send_header(&huart2, id) != HAL_OK) {
+        const char *e = "LIN: header send failed\r\n";
+        CDC_Transmit_FS((uint8_t*)e, strlen(e));
+        return;
+    }
+
+    uint8_t rx[9]; // up to 8 data + 1 checksum
+    int n = lin_receive_response(&huart2, rx, sizeof(rx), 20); // ~20 ms timeout
+
+    if (n <= 0) {
+        const char *e = "LIN: no response\r\n";
+        CDC_Transmit_FS((uint8_t*)e, strlen(e));
+    } else {
+        cdc_print_hex("LIN ID 0x01 -> ", rx, n);
+    }
+}
+
+// --- Helpers ---
+
+// Parity per LIN 2.x: ID = b5..b0, P0 on b6, P1 on b7
+static uint8_t make_lin_id_with_parity(uint8_t id6)
+{
+    id6 &= 0x3F;
+    uint8_t b0 = (id6 >> 0) & 1;
+    uint8_t b1 = (id6 >> 1) & 1;
+    uint8_t b2 = (id6 >> 2) & 1;
+    uint8_t b3 = (id6 >> 3) & 1;
+    uint8_t b4 = (id6 >> 4) & 1;
+    uint8_t b5 = (id6 >> 5) & 1;
+
+    uint8_t p0 = (b0 ^ b1 ^ b2 ^ b4) & 1;
+    uint8_t p1 = (~(b1 ^ b3 ^ b4 ^ b5)) & 1;
+
+    return (uint8_t)(id6 | (p0 << 6) | (p1 << 7));
+}
+
+// Send BREAK + SYNC(0x55) + ID(with parity)
+static HAL_StatusTypeDef lin_send_header(UART_HandleTypeDef *huart, uint8_t id6)
+{
+    // Send BREAK (CubeMX must have enabled LIN mode for this UART)
+    if (HAL_LIN_SendBreak(huart) != HAL_OK) return HAL_ERROR;
+
+    // SYNC field
+    uint8_t sync = 0x55;
+    if (HAL_UART_Transmit(huart, &sync, 1, 5) != HAL_OK) return HAL_ERROR;
+
+    // ID with parity
+    uint8_t idp = make_lin_id_with_parity(id6);
+    if (HAL_UART_Transmit(huart, &idp, 1, 5) != HAL_OK) return HAL_ERROR;
+
+    return HAL_OK;
+}
+
+// Read up to max_len bytes until timeout (slave data + checksum)
+static int lin_receive_response(UART_HandleTypeDef *huart, uint8_t *buf, int max_len, uint32_t timeout_ms)
+{
+    // Simple blocking read; for production, use DMA + IDLE detection
+    int n = 0;
+    uint32_t t0 = HAL_GetTick();
+    while (n < max_len) {
+        if (HAL_UART_Receive(huart, &buf[n], 1, 1) == HAL_OK) {
+            n++;
+            t0 = HAL_GetTick(); // got something; extend window
+        }
+        if ((HAL_GetTick() - t0) > timeout_ms) break;
+    }
+    return n; // 0 means no data
+}
+
+static void cdc_print_hex(const char *prefix, const uint8_t *data, int len)
+{
+    char line[128];
+    int off = snprintf(line, sizeof(line), "%s", prefix);
+    for (int i = 0; i < len && off < (int)sizeof(line) - 4; ++i) {
+        off += snprintf(line + off, sizeof(line) - off, "%02X ", data[i]);
+    }
+    if (off < (int)sizeof(line) - 2) line[off++] = '\r', line[off++] = '\n';
+    CDC_Transmit_FS((uint8_t*)line, off);
+}
 
 /* USER CODE END 0 */
 
@@ -98,9 +187,12 @@ int main(void)
   MX_I2C1_Init();
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
-  MX_USB_OTG_FS_PCD_Init();
+  MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
 
+  HAL_Delay(1000);
+  HAL_GPIO_WritePin(LIN_CS_GPIO_Port, LIN_CS_Pin, GPIO_PIN_SET); //set LIN txcvr CS pin high
+  const char *msg = "Hello BMW\r\n";
 
   /* USER CODE END 2 */
 
@@ -108,23 +200,25 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  for (HalfBridge_t hb = HB1; hb <= HB5; hb++) {
-	      SetHalfBridge(hb, DIR_FORWARD);
-	      HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
-	      HAL_Delay(3000);  // 3 seconds forward
-	      HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
-
-	      SetHalfBridge(hb, DIR_REVERSE);
-	      HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
-	      HAL_Delay(3000);  // 3 seconds reverse
-	      HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
-	      SetHalfBridge(hb, DIR_IDLE);  // Optional step before idle all
-	      HAL_Delay(1000);  // Pause 1 second
-	      HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
-
-	      SetHalfBridge(IDLE_MOTOR, DIR_IDLE);  // All off
-	      HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
-	    }
+	  LIN_Ping_And_Print();
+	  HAL_Delay(1100);
+//	  for (HalfBridge_t hb = HB1; hb <= HB5; hb++) {
+//	      SetHalfBridge(hb, DIR_FORWARD);
+//	      HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+//	      HAL_Delay(3000);  // 3 seconds forward
+//	      HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+//
+//	      SetHalfBridge(hb, DIR_REVERSE);
+//	      HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+//	      HAL_Delay(3000);  // 3 seconds reverse
+//	      HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+//	      SetHalfBridge(hb, DIR_IDLE);  // Optional step before idle all
+//	      HAL_Delay(1000);  // Pause 1 second
+//	      HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+//
+//	      SetHalfBridge(IDLE_MOTOR, DIR_IDLE);  // All off
+//	      HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+//	    }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -276,41 +370,6 @@ static void MX_USART2_UART_Init(void)
   /* USER CODE BEGIN USART2_Init 2 */
 
   /* USER CODE END USART2_Init 2 */
-
-}
-
-/**
-  * @brief USB_OTG_FS Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USB_OTG_FS_PCD_Init(void)
-{
-
-  /* USER CODE BEGIN USB_OTG_FS_Init 0 */
-
-  /* USER CODE END USB_OTG_FS_Init 0 */
-
-  /* USER CODE BEGIN USB_OTG_FS_Init 1 */
-
-  /* USER CODE END USB_OTG_FS_Init 1 */
-  hpcd_USB_OTG_FS.Instance = USB_OTG_FS;
-  hpcd_USB_OTG_FS.Init.dev_endpoints = 4;
-  hpcd_USB_OTG_FS.Init.speed = PCD_SPEED_FULL;
-  hpcd_USB_OTG_FS.Init.dma_enable = DISABLE;
-  hpcd_USB_OTG_FS.Init.phy_itface = PCD_PHY_EMBEDDED;
-  hpcd_USB_OTG_FS.Init.Sof_enable = DISABLE;
-  hpcd_USB_OTG_FS.Init.low_power_enable = DISABLE;
-  hpcd_USB_OTG_FS.Init.lpm_enable = DISABLE;
-  hpcd_USB_OTG_FS.Init.vbus_sensing_enable = DISABLE;
-  hpcd_USB_OTG_FS.Init.use_dedicated_ep1 = DISABLE;
-  if (HAL_PCD_Init(&hpcd_USB_OTG_FS) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USB_OTG_FS_Init 2 */
-
-  /* USER CODE END USB_OTG_FS_Init 2 */
 
 }
 
