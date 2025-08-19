@@ -24,6 +24,7 @@
 /* USER CODE BEGIN Includes */
 #include "board.h"
 #include "usbd_cdc_if.h"
+#include "lin.h"
 #include <string.h>
 #include <stdio.h>
 /* USER CODE END Includes */
@@ -31,10 +32,7 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 extern UART_HandleTypeDef huart2;   // USART2 from CubeMX (LIN mode)
-static uint8_t make_lin_id_with_parity(uint8_t id6);
-static HAL_StatusTypeDef lin_send_header(UART_HandleTypeDef *huart, uint8_t id6);
-static int lin_receive_response(UART_HandleTypeDef *huart, uint8_t *buf, int max_len, uint32_t timeout_ms);
-static void cdc_print_hex(const char *prefix, const uint8_t *data, int len);
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -62,141 +60,15 @@ static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_USART2_UART_Init(void);
-static void uart_flush_errors(UART_HandleTypeDef* hu);
+
 
 /* USER CODE BEGIN PFP */
-void SetHalfBridge(HalfBridge_t hb, Direction_t dir);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-void LIN_Ping_And_Print(void)
-{
-    uint8_t tx[2] = { 0x55, 0xC1 };   // SYNC + PID for ID 0x01
 
-    // Optional but recommended: keep RX off during header to avoid echo/junk
-    CLEAR_BIT(huart2.Instance->CR1, USART_CR1_RE);
-
-    HAL_LIN_SendBreak(&huart2);
-    HAL_UART_Transmit(&huart2, tx, 2, 20);   // <-- length = 2 (not 3)
-
-    // Flush BREAK artifacts so first slave byte isn't lost
-    __HAL_UART_CLEAR_FEFLAG(&huart2);
-    __HAL_UART_CLEAR_NEFLAG(&huart2);
-    __HAL_UART_CLEAR_OREFLAG(&huart2);
-#if defined(USART_RDR_RDR) || defined(USART_ISR_RXNE)
-    (void)huart2.Instance->ISR; (void)huart2.Instance->RDR;
-#else
-    (void)huart2.Instance->SR;  (void)huart2.Instance->DR;
-#endif
-    huart2.ErrorCode = HAL_UART_ERROR_NONE;
-
-    // Re-enable RX to catch the response
-    SET_BIT(huart2.Instance->CR1, USART_CR1_RE);
-
-    uint8_t rx[9];
-    int n = lin_receive_response(&huart2, rx, sizeof(rx), 80); // try 50–100 ms first
-    if (n <= 0) {
-        CDC_Transmit_FS((uint8_t*)"LIN: no response\r\n", 18);
-    } else {
-        cdc_print_hex("LIN ID 0x01 -> ", rx, n);
-    }
-}
-
-
-// --- Helpers ---
-
-// Parity per LIN 2.x: ID = b5..b0, P0 on b6, P1 on b7
-static uint8_t make_lin_id_with_parity(uint8_t id6)
-{
-    id6 &= 0x3F;
-    uint8_t b0 = (id6 >> 0) & 1;
-    uint8_t b1 = (id6 >> 1) & 1;
-    uint8_t b2 = (id6 >> 2) & 1;
-    uint8_t b3 = (id6 >> 3) & 1;
-    uint8_t b4 = (id6 >> 4) & 1;
-    uint8_t b5 = (id6 >> 5) & 1;
-
-    uint8_t p0 = (b0 ^ b1 ^ b2 ^ b4) & 1;
-    uint8_t p1 = (~(b1 ^ b3 ^ b4 ^ b5)) & 1;
-
-    return (uint8_t)(id6 | (p0 << 6) | (p1 << 7));
-}
-
-// Send BREAK + SYNC(0x55) + ID(with parity)
-static HAL_StatusTypeDef lin_send_header(UART_HandleTypeDef *huart, uint8_t id6)
-{
-    // 1) Keep RX off while we transmit BREAK+SYNC+PID
-    CLEAR_BIT(huart->Instance->CR1, USART_CR1_RE);
-
-    if (HAL_LIN_SendBreak(huart) != HAL_OK) goto err;
-
-    uint8_t sync = 0x55;
-    if (HAL_UART_Transmit(huart, &sync, 1, 5) != HAL_OK) goto err;
-
-    uint8_t pid = make_lin_id_with_parity(id6);   // 0x01 -> 0xC1
-    if (HAL_UART_Transmit(huart, &pid, 1, 5) != HAL_OK) goto err;
-
-    // 2) Flush errors/junk from our own header
-    __HAL_UART_CLEAR_FEFLAG(huart);
-    __HAL_UART_CLEAR_NEFLAG(huart);
-    __HAL_UART_CLEAR_OREFLAG(huart);
-#if defined(USART_RDR_RDR) || defined(USART_ISR_RXNE)
-    (void)huart->Instance->ISR; (void)huart->Instance->RDR;
-#else
-    (void)huart->Instance->SR;  (void)huart->Instance->DR;
-#endif
-    huart->ErrorCode = HAL_UART_ERROR_NONE;
-
-    // 3) Turn RX back on right before the slave talks
-    SET_BIT(huart->Instance->CR1, USART_CR1_RE);
-    return HAL_OK;
-
-err:
-    SET_BIT(huart->Instance->CR1, USART_CR1_RE);
-    return HAL_ERROR;
-}
-
-
-// Read up to max_len bytes until timeout (slave data + checksum)
-static int lin_receive_response(UART_HandleTypeDef *huart, uint8_t *buf, int max_len, uint32_t timeout_ms)
-{
-    // Simple blocking read; for production, use DMA + IDLE detection
-    int n = 0;
-    uint32_t t0 = HAL_GetTick();
-    while (n < max_len) {
-        if (HAL_UART_Receive(huart, &buf[n], 1, 1) == HAL_OK) {
-            n++;
-            t0 = HAL_GetTick(); // got something; extend window
-        }
-        if ((HAL_GetTick() - t0) > timeout_ms) break;
-    }
-    return n; // 0 means no data
-}
-
-static void cdc_print_hex(const char *prefix, const uint8_t *data, int len)
-{
-    char line[128];
-    int off = snprintf(line, sizeof(line), "%s", prefix);
-    for (int i = 0; i < len && off < (int)sizeof(line) - 4; ++i) {
-        off += snprintf(line + off, sizeof(line) - off, "%02X ", data[i]);
-    }
-    if (off < (int)sizeof(line) - 2) line[off++] = '\r', line[off++] = '\n';
-    CDC_Transmit_FS((uint8_t*)line, off);
-}
-
-static void uart_flush_errors(UART_HandleTypeDef* hu)
-{
-  __HAL_UART_CLEAR_FEFLAG(hu);
-  __HAL_UART_CLEAR_NEFLAG(hu);
-  __HAL_UART_CLEAR_OREFLAG(hu);
-#if defined(USART_RDR_RDR) || defined(USART_ISR_RXNE) // F0/L4/G4 style
-  (void)hu->Instance->ISR; (void)hu->Instance->RDR;
-#else // F1/F2/F3/F4 style
-  (void)hu->Instance->SR;  (void)hu->Instance->DR;
-#endif
-  hu->ErrorCode = HAL_UART_ERROR_NONE;
-}
 /* USER CODE END 0 */
 
 /**
@@ -243,8 +115,8 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  LIN_Ping_And_Print();
-	  HAL_Delay(250);
+	  Board_ReadLinAndDrive();
+	  HAL_Delay(50);
 //	  for (HalfBridge_t hb = HB1; hb <= HB5; hb++) {
 //	      SetHalfBridge(hb, DIR_FORWARD);
 //	      HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);

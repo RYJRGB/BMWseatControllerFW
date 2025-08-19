@@ -18,4 +18,6 @@ typedef enum {
 
 void SetHalfBridge(HalfBridge_t hb, Direction_t dir);
 
+void Board_ReadLinAndDrive(void);
+
 #endif // BOARD_H

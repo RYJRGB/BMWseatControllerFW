@@ -1,0 +1,6 @@
+../Core/Src/lin.c:7:6:LIN_Ping_And_Print	40	static
+../Core/Src/lin.c:35:9:make_lin_id_with_parity	24	static
+../Core/Src/lin.c:52:19:lin_send_header	32	static
+../Core/Src/lin.c:77:5:lin_receive_response	32	static
+../Core/Src/lin.c:91:6:cdc_print_hex	160	static
+../Core/Src/lin.c:102:6:uart_flush_errors	32	static

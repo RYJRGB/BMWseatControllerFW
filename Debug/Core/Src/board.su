@@ -1,1 +1,5 @@
-../Core/Src/board.c:5:6:SetHalfBridge	96	static
+../Core/Src/board.c:21:20:action_name	16	static
+../Core/Src/board.c:37:21:decode_action	16	static
+../Core/Src/board.c:64:13:drive_for_action	24	static
+../Core/Src/board.c:96:6:Board_ReadLinAndDrive	88	static
+../Core/Src/board.c:137:6:SetHalfBridge	96	static
