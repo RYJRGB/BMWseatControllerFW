@@ -53,7 +53,7 @@ UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-
+uint8_t TxData[20];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -62,6 +62,8 @@ static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_USART2_UART_Init(void);
+static void uart_flush_errors(UART_HandleTypeDef* hu);
+
 /* USER CODE BEGIN PFP */
 void SetHalfBridge(HalfBridge_t hb, Direction_t dir);
 /* USER CODE END PFP */
@@ -70,26 +72,37 @@ void SetHalfBridge(HalfBridge_t hb, Direction_t dir);
 /* USER CODE BEGIN 0 */
 void LIN_Ping_And_Print(void)
 {
-    HAL_Delay(1000); // give host time to open the COM port (simple safety)
+    uint8_t tx[2] = { 0x55, 0xC1 };   // SYNC + PID for ID 0x01
 
-    uint8_t id = 0x01; // 6-bit LIN ID (0..63)
+    // Optional but recommended: keep RX off during header to avoid echo/junk
+    CLEAR_BIT(huart2.Instance->CR1, USART_CR1_RE);
 
-    if (lin_send_header(&huart2, id) != HAL_OK) {
-        const char *e = "LIN: header send failed\r\n";
-        CDC_Transmit_FS((uint8_t*)e, strlen(e));
-        return;
-    }
+    HAL_LIN_SendBreak(&huart2);
+    HAL_UART_Transmit(&huart2, tx, 2, 20);   // <-- length = 2 (not 3)
 
-    uint8_t rx[9]; // up to 8 data + 1 checksum
-    int n = lin_receive_response(&huart2, rx, sizeof(rx), 20); // ~20 ms timeout
+    // Flush BREAK artifacts so first slave byte isn't lost
+    __HAL_UART_CLEAR_FEFLAG(&huart2);
+    __HAL_UART_CLEAR_NEFLAG(&huart2);
+    __HAL_UART_CLEAR_OREFLAG(&huart2);
+#if defined(USART_RDR_RDR) || defined(USART_ISR_RXNE)
+    (void)huart2.Instance->ISR; (void)huart2.Instance->RDR;
+#else
+    (void)huart2.Instance->SR;  (void)huart2.Instance->DR;
+#endif
+    huart2.ErrorCode = HAL_UART_ERROR_NONE;
 
+    // Re-enable RX to catch the response
+    SET_BIT(huart2.Instance->CR1, USART_CR1_RE);
+
+    uint8_t rx[9];
+    int n = lin_receive_response(&huart2, rx, sizeof(rx), 80); // try 50–100 ms first
     if (n <= 0) {
-        const char *e = "LIN: no response\r\n";
-        CDC_Transmit_FS((uint8_t*)e, strlen(e));
+        CDC_Transmit_FS((uint8_t*)"LIN: no response\r\n", 18);
     } else {
         cdc_print_hex("LIN ID 0x01 -> ", rx, n);
     }
 }
+
 
 // --- Helpers ---
 
@@ -113,19 +126,37 @@ static uint8_t make_lin_id_with_parity(uint8_t id6)
 // Send BREAK + SYNC(0x55) + ID(with parity)
 static HAL_StatusTypeDef lin_send_header(UART_HandleTypeDef *huart, uint8_t id6)
 {
-    // Send BREAK (CubeMX must have enabled LIN mode for this UART)
-    if (HAL_LIN_SendBreak(huart) != HAL_OK) return HAL_ERROR;
+    // 1) Keep RX off while we transmit BREAK+SYNC+PID
+    CLEAR_BIT(huart->Instance->CR1, USART_CR1_RE);
 
-    // SYNC field
+    if (HAL_LIN_SendBreak(huart) != HAL_OK) goto err;
+
     uint8_t sync = 0x55;
-    if (HAL_UART_Transmit(huart, &sync, 1, 5) != HAL_OK) return HAL_ERROR;
+    if (HAL_UART_Transmit(huart, &sync, 1, 5) != HAL_OK) goto err;
 
-    // ID with parity
-    uint8_t idp = make_lin_id_with_parity(id6);
-    if (HAL_UART_Transmit(huart, &idp, 1, 5) != HAL_OK) return HAL_ERROR;
+    uint8_t pid = make_lin_id_with_parity(id6);   // 0x01 -> 0xC1
+    if (HAL_UART_Transmit(huart, &pid, 1, 5) != HAL_OK) goto err;
 
+    // 2) Flush errors/junk from our own header
+    __HAL_UART_CLEAR_FEFLAG(huart);
+    __HAL_UART_CLEAR_NEFLAG(huart);
+    __HAL_UART_CLEAR_OREFLAG(huart);
+#if defined(USART_RDR_RDR) || defined(USART_ISR_RXNE)
+    (void)huart->Instance->ISR; (void)huart->Instance->RDR;
+#else
+    (void)huart->Instance->SR;  (void)huart->Instance->DR;
+#endif
+    huart->ErrorCode = HAL_UART_ERROR_NONE;
+
+    // 3) Turn RX back on right before the slave talks
+    SET_BIT(huart->Instance->CR1, USART_CR1_RE);
     return HAL_OK;
+
+err:
+    SET_BIT(huart->Instance->CR1, USART_CR1_RE);
+    return HAL_ERROR;
 }
+
 
 // Read up to max_len bytes until timeout (slave data + checksum)
 static int lin_receive_response(UART_HandleTypeDef *huart, uint8_t *buf, int max_len, uint32_t timeout_ms)
@@ -154,6 +185,18 @@ static void cdc_print_hex(const char *prefix, const uint8_t *data, int len)
     CDC_Transmit_FS((uint8_t*)line, off);
 }
 
+static void uart_flush_errors(UART_HandleTypeDef* hu)
+{
+  __HAL_UART_CLEAR_FEFLAG(hu);
+  __HAL_UART_CLEAR_NEFLAG(hu);
+  __HAL_UART_CLEAR_OREFLAG(hu);
+#if defined(USART_RDR_RDR) || defined(USART_ISR_RXNE) // F0/L4/G4 style
+  (void)hu->Instance->ISR; (void)hu->Instance->RDR;
+#else // F1/F2/F3/F4 style
+  (void)hu->Instance->SR;  (void)hu->Instance->DR;
+#endif
+  hu->ErrorCode = HAL_UART_ERROR_NONE;
+}
 /* USER CODE END 0 */
 
 /**
@@ -201,7 +244,7 @@ int main(void)
   while (1)
   {
 	  LIN_Ping_And_Print();
-	  HAL_Delay(1100);
+	  HAL_Delay(250);
 //	  for (HalfBridge_t hb = HB1; hb <= HB5; hb++) {
 //	      SetHalfBridge(hb, DIR_FORWARD);
 //	      HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
@@ -363,7 +406,7 @@ static void MX_USART2_UART_Init(void)
   huart2.Init.Mode = UART_MODE_TX_RX;
   huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
   huart2.Init.OverSampling = UART_OVERSAMPLING_16;
-  if (HAL_LIN_Init(&huart2, UART_LINBREAKDETECTLENGTH_10B) != HAL_OK)
+  if (HAL_LIN_Init(&huart2, UART_LINBREAKDETECTLENGTH_11B) != HAL_OK)
   {
     Error_Handler();
   }
